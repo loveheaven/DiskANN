@@ -37,6 +37,7 @@
 
 #define BLOCK_SIZE 5000000
 
+// 根据采样率，从base_file里采样数据，并写入倒output里面
 template<typename T>
 void gen_random_slice(const std::string base_file,
                       const std::string output_prefix, double sampling_rate) {
@@ -187,6 +188,8 @@ void gen_random_slice(const T *inputdata, size_t npts, size_t ndims,
 // num_pq_chunks (if it divides dimension, else rounded) chunks, and runs
 // k-means in each chunk to compute the PQ pivots and stores in bin format in
 // file pq_pivots_path as a s num_centers*dim floating point binary file
+// 支点的维度大小是dim/num_pq_chunks。支点的个数是num_centers* num_pq_chunks;
+// 合并到full_pivot_data之后的维度就是dim，个数是num_centers
 int generate_pq_pivots(const float *passed_train_data, size_t num_train,
                        unsigned dim, unsigned num_centers,
                        unsigned num_pq_chunks, unsigned max_k_means_reps,
@@ -211,6 +214,7 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
 
   std::unique_ptr<float[]> full_pivot_data;
 
+  //如果文件已经存在，读取并返回。
   if (file_exists(pq_pivots_path)) {
     size_t file_dim, file_num_centers;
     diskann::load_bin<float>(pq_pivots_path, full_pivot_data, file_num_centers,
@@ -254,13 +258,15 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
   std::vector<float> bin_loads(num_pq_chunks, 0);
 
   // Process dimensions not inserted by previous loop
+  // 这个for循环用于把0到dim每一维分到对应的chunk上。比如dim是128，chunk数是4，就把0-31分到chunk0上。
+  // bin_to_dims存储这个对应关系。
   for (uint32_t d = 0; d < dim; d++) {
     if (dim_to_bin.find(d) != dim_to_bin.end())
       continue;
     auto  cur_best = num_pq_chunks + 1;
     float cur_best_load = std::numeric_limits<float>::max();
     for (uint32_t b = 0; b < num_pq_chunks; b++) {
-      if (bin_loads[b] < cur_best_load &&
+      if (bin_loads[b] < cur_best_load && //this condition is always true because bin_loads[b]=0
           bin_to_dims[b].size() < cur_bin_threshold) {
         cur_best = b;
         cur_best_load = bin_loads[b];
@@ -274,7 +280,7 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
       if (cur_num_high == max_num_high)
         cur_bin_threshold = low_val;
     }
-  }
+  } // end for d
 
   rearrangement.clear();
   chunk_offsets.clear();
@@ -291,6 +297,9 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
       chunk_offsets.push_back(chunk_offsets[b - 1] +
                               (unsigned) bin_to_dims[b - 1].size());
   }
+  // chunk_offsets存储的是每个chunk对应维度的最大值。假设维度是128，chunk是4，
+  // 那么chunk_offsets存放的是32，64，96，128.
+  // rearrangement存放的是0-127
   chunk_offsets.push_back(dim);
 
   diskann::cout << "\nCross-checking rearranged order of coordinates:"
@@ -302,6 +311,7 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
   full_pivot_data.reset(new float[num_centers * dim]);
 
   for (size_t i = 0; i < num_pq_chunks; i++) {
+    // 当前chunk的大小
     size_t cur_chunk_size = chunk_offsets[i + 1] - chunk_offsets[i];
 
     if (cur_chunk_size == 0)
@@ -324,13 +334,15 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
                   cur_chunk_size * sizeof(float));
     }
 
+    //获取初始支点，存放在cur_pivot_data里。支点维度是cur_chunk_size
     kmeans::kmeanspp_selecting_pivots(cur_data.get(), num_train, cur_chunk_size,
                                       cur_pivot_data.get(), num_centers);
-
+    // 通过聚类，更新支点，并把更新结果存放在cur_pivot_data里
     kmeans::run_lloyds(cur_data.get(), num_train, cur_chunk_size,
                        cur_pivot_data.get(), num_centers, max_k_means_reps,
                        NULL, closest_center.get());
-
+    
+    // full_pivot_data把各个chunk的支点merge在一起。
     for (uint64_t j = 0; j < num_centers; j++) {
       std::memcpy(full_pivot_data.get() + j * dim + chunk_offsets[i],
                   cur_pivot_data.get() + j * cur_chunk_size,
@@ -357,6 +369,8 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
 // pq_compressed_vectors_path.
 // If the numbber of centers is < 256, it stores as byte vector, else as 4-byte
 // vector in binary format.
+// 计算每个点对应的中心，并把中心编号保存到block_compressed_base里，作为该点的编码。
+// 然后把结果写到pq_compressed_vectors_path文件里。
 template<typename T>
 int generate_pq_data_from_pivots(const std::string data_file,
                                  unsigned num_centers, unsigned num_pq_chunks,
@@ -511,6 +525,7 @@ int generate_pq_data_from_pivots(const std::string data_file,
                                           cur_chunk_size, cur_pivot_data.get(),
                                           num_centers, 1, closest_center.get());
 
+      // 计算当前chunk，每个点对应的中心，并把中心编号保存到block_compressed_base里，作为该点的编码。
 #pragma omp parallel for schedule(static, 8192)
       for (int64_t j = 0; j < (_s64) cur_blk_size; j++) {
         block_compressed_base[j * num_pq_chunks + i] = closest_center[j];
@@ -541,6 +556,8 @@ int generate_pq_data_from_pivots(const std::string data_file,
   return 0;
 }
 
+// 抽样1%的数据，把每个数据点分到num_centers里的k_base个中心上去。
+// 然后把每个中心的分到的数据量除以1%，来预估每个中心对应的真实数据量。
 template<typename T>
 int estimate_cluster_sizes(const std::string data_file, float *pivots,
                            const size_t num_centers, const size_t dim,
@@ -607,6 +624,8 @@ int estimate_cluster_sizes(const std::string data_file, float *pivots,
   return 0;
 }
 
+// 计算每个数据分配到指定中心点中的最近的k_base个中心点上去。
+// 并生成_subshard-i.bin和_subshard-i_ids_uint32.bin
 template<typename T>
 int shard_data_into_clusters(const std::string data_file, float *pivots,
                              const size_t num_centers, const size_t dim,
@@ -762,6 +781,13 @@ int partition(const std::string data_file, const float sampling_rate,
   return 0;
 }
 
+// 先默认指定数据将分成3个中心。然后先采样数据，通过lloyds算法聚类得到这三个pivot点。
+// 然后抽样1%的数据，把每个数据点分到3个中心点里的k_base个中心上去。
+// 然后把每个中心的分到的数据量除以1%，来预估每个中心对应的真实数据量。
+// 如果超过内存，把中心点数据加1，变成4个。重复上面的步骤。直到内存放得下。
+// 然后将得到的中心点存储到"_centroids.bin"
+// 然后将全部数据分配到所有中心点的两个k_base中心上去。
+// 并生成_subshard-i.bin和_subshard-i_ids_uint32.bin
 template<typename T>
 int partition_with_ram_budget(const std::string data_file,
                               const double sampling_rate, double ram_budget,

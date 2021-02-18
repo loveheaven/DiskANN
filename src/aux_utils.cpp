@@ -170,6 +170,9 @@ namespace diskann {
     reader.close();
   }
 
+  // 将各个shard的数据merge在一起，并且把各个shard的medoid（实际上是_ep，导航点）写入到medoids_file。
+  // output_vamana里写入到的数据是：文件大小，指定的max_degree，最后一个shard的medoid,然后是每个
+  // nodeid对应的邻接list大小和数据。nodeid是按照从小到大排序的。
   int merge_shards(const std::string &vamana_prefix,
                    const std::string &vamana_suffix,
                    const std::string &idmaps_prefix,
@@ -209,6 +212,7 @@ namespace diskann {
         node_shard.push_back(std::make_pair((_u32) node_id, (_u32) shard));
       }
     }
+    // nodeid的大小排序，把各个shard相同nodeid的数据放在一起
     std::sort(node_shard.begin(), node_shard.end(), [](const auto &left,
                                                        const auto &right) {
       return left.first < right.first ||
@@ -287,6 +291,7 @@ namespace diskann {
     for (const auto &id_shard : node_shard) {
       unsigned node_id = id_shard.first;
       unsigned shard_id = id_shard.second;
+      // 如果nodeid变了，则写入上一个nodeid的数据。打乱后数据取max_degree个邻居写入。
       if (cur_id < node_id) {
         // Gopal. random_shuffle() is deprecated.
         std::shuffle(final_nhood.begin(), final_nhood.end(), urng);
@@ -314,6 +319,7 @@ namespace diskann {
 
       // rename nodes
       for (_u64 j = 0; j < shard_nnbrs; j++) {
+        //如果数据还没有加入到final_nhood，就放进final_nhood
         if (nhood_set[idmaps[shard_id][shard_nhood[j]]] == 0) {
           nhood_set[idmaps[shard_id][shard_nhood[j]]] = 1;
           final_nhood.emplace_back(idmaps[shard_id][shard_nhood[j]]);
@@ -341,6 +347,8 @@ namespace diskann {
     return 0;
   }
 
+  // 这个方法会生成centroid.bin(存放采样生成的各个中心点)，medoid_file(各个shard存放导航点)，
+  // 以及mem_index_path（存放merge后的索引）。
   template<typename T>
   int build_merged_vamana_index(std::string     base_file,
                                 diskann::Metric _compareMetric, unsigned L,
@@ -375,10 +383,13 @@ namespace diskann {
       return 0;
     }
     std::string merged_index_prefix = mem_index_path + "_tempFiles";
+    // 这一步会产生下面要用的_centroids.bin
+    // 并生成_subshard-i.bin和_subshard-i_ids_uint32.bin
     int         num_parts =
         partition_with_ram_budget<T>(base_file, sampling_rate, ram_budget,
                                      2 * R / 3, merged_index_prefix, 2);
 
+    // 将上面生成的_centroids.bin重命名成centroids_file
     std::string cur_centroid_filepath = merged_index_prefix + "_centroids.bin";
     std::rename(cur_centroid_filepath.c_str(), centroids_file.c_str());
 
@@ -484,6 +495,9 @@ namespace diskann {
       return best_bw;
     }
 
+  //按照扇区，把原始数据和索引图写入磁盘。
+  // metadata占一个扇区。
+  // denote d as 一个节点的原始向量数据+邻接lists数据. 多个d凑满一个扇区，就写入到磁盘上。
   template<typename T>
   void create_disk_layout(const std::string base_file,
                           const std::string mem_index_file,
@@ -531,6 +545,7 @@ namespace diskann {
     medoid = (_u64) medoid_u32;
     max_node_len =
         (((_u64) width_u32 + 1) * sizeof(unsigned)) + (ndims_64 * sizeof(T));
+    // 一个扇区能存放多少个node
     nnodes_per_sector = SECTOR_LEN / max_node_len;
 
     diskann::cout << "medoid: " << medoid << "B" << std::endl;
@@ -609,6 +624,12 @@ namespace diskann {
     diskann::cout << "Output file written." << std::endl;
   }
 
+  //这里会产生十个文件：
+  // 量化数据文件五个，在_pq_pivots.bin路径下：量化产生的支点数据文件、质心数据_centroid.bin、chuck对应维度数据_chunk_offsets.bin、
+  // rearrangement数据、以及各个点产生的量化值_pq_compressed.bin。
+  // 图索引数据三个，在_disk.index路径下：生成centroid.bin(存放采样生成的各个shard的中心点)，medoid_file(各个shard存放导航点)，
+  // 以及disk_index_path存放最终的图索引。
+  // 数据采样两个，在_sample下：把数据会最终采样一份存储下来sample和对应的id。
   template<typename T>
   bool build_disk_index(const char *dataFilePath, const char *indexFilePath,
                         const char *    indexBuildParameters,
@@ -675,6 +696,8 @@ namespace diskann {
 
     diskann::get_bin_metadata(dataFilePath, points_num, dim);
 
+    // index内存大小除以向量个数，就是每个点能占用的内存字节个数，也就是chunk数。
+    // 每个chunk由于是一个字节，最多对应256个中心。
     size_t num_pq_chunks =
         (size_t)(std::floor)(_u64(final_index_ram_limit / points_num));
 
@@ -698,8 +721,13 @@ namespace diskann {
     diskann::cout << "Training data loaded of size " << train_size <<
     std::endl;
 
+    // 采样部分数据，用来生成pq的中心点
+    //这里会产生四个文件：支点数据、采样数据的质心数据_centroid.bin、chuck对应维度数据_chunk_offsets.bin、
+    // rearrangement数据_rearrangement_perm.bin
     generate_pq_pivots(train_data, train_size, (uint32_t) dim, 256,
                        (uint32_t) num_pq_chunks, 15, pq_pivots_path);
+    // 把全部数据根据上面的中心点，生成pq量化后的data
+    // 这里会把pq编码之后的值写入1个文件_pq_compressed.bin。
     generate_pq_data_from_pivots<T>(dataFilePath, 256, (uint32_t)
     num_pq_chunks,
                                     pq_pivots_path,
@@ -709,6 +737,8 @@ namespace diskann {
 
     train_data = nullptr;
 
+    // 这个方法会生成centroid.bin(存放采样生成的各个shard的中心点)，medoid_file(各个shard存放导航点)，
+    // 以及mem_index_path（存放merge后的索引）。
     diskann::build_merged_vamana_index<T>(
         dataFilePath, _compareMetric, L, R, p_val, indexing_ram_budget,
         mem_index_path, medoids_path, centroids_path);

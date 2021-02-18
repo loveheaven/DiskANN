@@ -124,6 +124,8 @@ namespace diskann {
 
   // Initialize an index with metric m, load the data of type T with filename
   // (bin), and initialize max_points
+  // filename是输入向量的存放文件名。nd是向量个数。如果比filename里的少，就取前nd个。
+  // enable_tags是否使用外部tag。_store_data实际没有用到。
   template<typename T, typename TagT>
   Index<T, TagT>::Index(Metric m, const char *filename, const size_t max_points,
                         const size_t nd, const size_t num_frozen_pts,
@@ -209,8 +211,9 @@ namespace diskann {
     long long     total_gr_edges = 0;
     size_t        index_size = 0;
     std::ofstream out(std::string(filename), std::ios::binary | std::ios::out);
-
+    //是否支持立刻删除。
     if (_support_eager_delete)
+      //_compacted_order is true after eager deletion.
       if (_eager_done && (!_compacted_order)) {
         if (_nd < _max_points) {
           assert(_final_graph.size() == _max_points + _num_frozen_pts);
@@ -287,6 +290,7 @@ namespace diskann {
 
   // load the index from file and update the width (max_degree), ep
   // (navigating node id), and _final_graph (adjacency list)
+  // tag 是图里节点的名字或者说唯一id。
   template<typename T, typename TagT>
   void Index<T, TagT>::load(const char *filename, const bool load_tags,
                             const char *tag_filename) {
@@ -380,6 +384,7 @@ namespace diskann {
       const T *cur_vec = _data + (i * (size_t) _aligned_dim);
       dist = 0;
       float diff = 0;
+      //计算图中所有点，看看哪个和质心比较接近。
       for (size_t j = 0; j < _aligned_dim; j++) {
         diff = (center[j] - cur_vec[j]) * (center[j] - cur_vec[j]);
         dist += diff;
@@ -461,6 +466,7 @@ namespace diskann {
           if (inserted_into_pool.find(id) == inserted_into_pool.end()) {
             inserted_into_pool.insert(id);
 
+            // 预取下一个向量到cpu cache里，加速性能
             if ((m + 1) < _final_graph[n].size()) {
               auto nextn = _final_graph[n][m + 1];
               diskann::prefetch_vector(
@@ -495,6 +501,7 @@ namespace diskann {
     return std::make_pair(hops, cmps);
   }
 
+  //仿造nsg，找到从init_ids到node_id的最近邻，把沿路找过的点都加入expanded_nodes_info里。
   template<typename T, typename TagT>
   void Index<T, TagT>::get_expanded_nodes(
       const size_t node_id, const unsigned Lindex,
@@ -521,6 +528,7 @@ namespace diskann {
     occlude_list(pool, alpha, degree, maxc, result, occlude_factor);
   }
 
+  // occlude_factor=d(p,p′)/d(p∗,p′)
   template<typename T, typename TagT>
   void Index<T, TagT>::occlude_list(std::vector<Neighbor> &pool,
                                     const float alpha, const unsigned degree,
@@ -545,11 +553,11 @@ namespace diskann {
         occlude_factor[start] = std::numeric_limits<float>::max();
         result.push_back(p);
         for (unsigned t = start + 1; t < pool.size() && t < maxc; t++) {
-          if (occlude_factor[t] > alpha)
+          if (occlude_factor[t] > alpha) //if α·d(p∗,p′)≤d(p,p′) then remove p' from result
             continue;
           float djk = _distance->compare(
               _data + _aligned_dim * (size_t) pool[t].id,
-              _data + _aligned_dim * (size_t) p.id, (unsigned) _aligned_dim);
+              _data + _aligned_dim * (size_t) p.id, (unsigned) _aligned_dim);//p*p'
           occlude_factor[t] =
               (std::max)(occlude_factor[t], pool[t].distance / djk);
         }
@@ -817,8 +825,7 @@ namespace diskann {
         std::chrono::duration<double> diff;
 
 #pragma omp parallel for schedule(dynamic)
-        for (_s64 node_ctr = (_s64) start_id; node_ctr < (_s64) end_id;
-             ++node_ctr) {
+        for (_s64 node_ctr = (_s64) start_id; node_ctr < (_s64) end_id; ++node_ctr) {
           auto                     node = visit_order[node_ctr];
           size_t                   node_offset = node_ctr - start_id;
           tsl::robin_set<unsigned> visited;
@@ -846,7 +853,7 @@ namespace diskann {
               }
             }
           prune_neighbors(node, pool, parameters, pruned_list);
-        }
+        } //end for
         diff = std::chrono::high_resolution_clock::now() - s;
         sync_time += diff.count();
 
@@ -864,6 +871,7 @@ namespace diskann {
         }
         s = std::chrono::high_resolution_clock::now();
 
+        // 将node新调整的边插入到反向邻居里
 #pragma omp parallel for schedule(dynamic, 64)
         for (_s64 node_ctr = start_id; node_ctr < (_s64) end_id; ++node_ctr) {
           auto                   node = visit_order[node_ctr];
@@ -874,10 +882,9 @@ namespace diskann {
           pruned_list.clear();
           pruned_list.shrink_to_fit();
         }
-
+        //如果插入到反向邻居之后，超过反向邻居的限制大小，就重新选边做调整。类似于nsg的流程
 #pragma omp parallel for schedule(dynamic, 65536)
-        for (_s64 node_ctr = 0; node_ctr < (_s64)(visit_order.size());
-             node_ctr++) {
+        for (_s64 node_ctr = 0; node_ctr < (_s64)(visit_order.size()); node_ctr++) {
           auto node = visit_order[node_ctr];
           if (need_to_sync[node] != 0) {
             need_to_sync[node] = 0;
@@ -924,7 +931,7 @@ namespace diskann {
           inter_count = 0;
           progress_counter += 5;
         }
-      }
+      } // end for NUM_SYNCS
 // Gopal. Splittng diskann_dll into separate DLLs for search and build.
 // This code should only be available in the "build" DLL.
 #ifdef DISKANN_BUILD
@@ -936,7 +943,7 @@ namespace diskann {
       diskann::cout << "search+prune_time=" << total_sync_time
                     << "s, inter_time=" << total_inter_time
                     << "s, inter_count=" << total_inter_count << std::endl;
-    }
+    } // end for NUM_RNDS
 
     diskann::cout << "Starting final cleanup.." << std::flush;
 #pragma omp parallel for schedule(dynamic, 65536)
@@ -1205,6 +1212,7 @@ namespace diskann {
 
   // in case we add ''frozen'' auxiliary points to the dataset, these are not
   // visible to external world, we generate them here and update our dataset
+  // 用filename预定义的，如果没有就随机生成frozen points。
   template<typename T, typename TagT>
   int Index<T, TagT>::generate_random_frozen_points(const char *filename) {
     if (_has_built) {
@@ -1390,8 +1398,7 @@ namespace diskann {
     for (unsigned i = 0; i < _in_graph.size(); i++)
       _in_graph[i].clear();
 
-    for (unsigned i = 0; i < _final_graph.size();
-         i++)  // copying to in-neighbor graph
+    for (unsigned i = 0; i < _final_graph.size(); i++)  // copying to in-neighbor graph
 
       for (unsigned j = 0; j < _final_graph[i].size(); j++) {
         if (std::find(_in_graph[_final_graph[i][j]].begin(),
@@ -1503,6 +1510,7 @@ namespace diskann {
     return _nd;
   }
 
+  // get new location corresponding to each undeleted tag after deletions
   template<typename T, typename TagT>
   std::vector<unsigned> Index<T, TagT>::get_new_location(unsigned &active) {
     std::vector<unsigned> new_location;

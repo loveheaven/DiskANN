@@ -109,6 +109,7 @@ namespace diskann {
   }
 
   // get_bin_metadata functions START
+  //从一个文件读两个int，分别是行数和列数。
   inline void get_bin_metadata_impl(std::basic_istream<char>& reader,
                                     size_t& nrows, size_t& ncols) {
     int nrows_32, ncols_32;
@@ -150,6 +151,7 @@ namespace diskann {
   }
 
   // load_bin functions START
+  // 从文件里读出向量数、向量维度、向量数据
   template<typename T>
   inline void load_bin_impl(std::basic_istream<char>& reader,
                             size_t actual_file_size, T*& data, size_t& npts,
@@ -326,7 +328,7 @@ namespace diskann {
   }
 
   // load_aligned_bin functions START
-
+  // 把数据加载进来，把向量维度扩充成8的倍数。原向量不足8的倍数的，补0.
   template<typename T>
   inline void load_aligned_bin_impl(std::basic_istream<char>& reader,
                                     size_t actual_file_size, T*& data,
@@ -435,6 +437,14 @@ namespace diskann {
   inline void prefetch_vector(const char* vec, size_t vecsize) {
     size_t max_prefetch_size = (vecsize / 64) * 64;
     for (size_t d = 0; d < max_prefetch_size; d += 64)
+    /*
+   *_mm_prefetch从地址P处预取尺寸为cache line大小的数据缓存，参数i指示预取方式（_MM_HINT_T0, _MM_HINT_T1, _MM_HINT_T2, _MM_HINT_NTA，分别表示不同的预取方式）
+T0 预取数据到所有级别的缓存，包括L0。
+T1 预取数据到除L0外所有级别的缓存。
+T2 预取数据到除L0和L1外所有级别的缓存。
+NTA 预取数据到非临时缓冲结构中，可以最小化对缓存的污染。
+如果在CPU操作数据之前，我们就已经将数据主动加载到缓存中，那么就减少了由于缓存不命中，需要从内存取数的情况，这样就可以加速操作，获得性能上提升。使用主动缓存技术来优化内存拷贝。
+   */
       _mm_prefetch((const char*) vec + d, _MM_HINT_T0);
   }
 

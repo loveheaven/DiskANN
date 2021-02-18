@@ -62,6 +62,11 @@ namespace {
     }
   }
 
+  // pq_dists存放的是query到pq pivots的距离。数据格式chunk: query-p0,query-p1,query-p2...
+  // 每个点的pq编码是[chunk0-pIndex,chunck1-pIndex...]。到该点的chunk0，取出pIndex,
+  // 再到pq_dists的chuck0里查出query到pIndex中心的距离，作为到query到该点第0维的距离。
+  // 然后把该点到query各个维度的距离加在一起，就是该点到query的距离。
+  // dists_out存放的是每个点到query的距离。
   void pq_dist_lookup(const _u8 *pq_ids, const _u64 n_pts,
                       const _u64 pq_nchunks, const float *pq_dists,
                       float *dists_out) {
@@ -204,7 +209,7 @@ namespace diskann {
         diskann::alloc_aligned((void **) &scratch.aligned_scratch,
                                256 * sizeof(float), 256);
         diskann::alloc_aligned((void **) &scratch.aligned_pq_coord_scratch,
-                               25600 * sizeof(_u8), 256);
+                               25600 * sizeof(_u8), 256);// max pq chuck is 100
         diskann::alloc_aligned((void **) &scratch.aligned_pqtable_dist_scratch,
                                25600 * sizeof(float), 256);
         diskann::alloc_aligned((void **) &scratch.aligned_dist_scratch,
@@ -568,9 +573,9 @@ namespace diskann {
     std::string pq_table_bin = std::string(pq_prefix) + "_pivots.bin";
     std::string pq_compressed_vectors =
         std::string(pq_prefix) + "_compressed.bin";
-    std::string medoids_file = std::string(disk_index_file) + "_medoids.bin";
+    std::string medoids_file = std::string(disk_index_file) + "_medoids.bin";//导航点
     std::string centroids_file =
-        std::string(disk_index_file) + "_centroids.bin";
+        std::string(disk_index_file) + "_centroids.bin";// shard的中心
 
     size_t pq_file_dim, pq_file_num_centroids;
 #ifdef EXEC_ENV_OLS
@@ -800,6 +805,10 @@ namespace diskann {
     _u64 &sector_scratch_idx = query_scratch->sector_idx;
 
     // query <-> PQ chunk centers distances
+    /* pq_dists is look like
+     *  chunk0: p1-query,p2-query,...
+     *  chunk1: p1-query,p2-query,...
+     */ 
     float *pq_dists = query_scratch->aligned_pqtable_dist_scratch;
     pq_table.populate_chunk_distances(query, pq_dists);
 
@@ -810,15 +819,21 @@ namespace diskann {
     // lambda to batch compute query<-> node distances in PQ space
     auto compute_dists = [this, pq_coord_scratch, pq_dists](
         const unsigned *ids, const _u64 n_ids, float *dists_out) {
+      // this->data存放各个node的pq编码数据。
+      // 这个函数将data里的这些ids的pq编码copy到pq_coord_scratch
       ::aggregate_coords(ids, n_ids, this->data, this->n_chunks,
                          pq_coord_scratch);
+      //然后计算这些点到query的距离。点到query的距离，是用query到各个中心的距离来代替的。
+      // 然后点用自己的编码查query到对应中心的距离，加起来就是点到query的距离。
       ::pq_dist_lookup(pq_coord_scratch, n_ids, this->n_chunks, pq_dists,
                        dists_out);
     };
     Timer                 query_timer, io_timer, cpu_timer;
+    // 存放候选集
     std::vector<Neighbor> retset(l_search + 1);
     tsl::robin_set<_u64>  visited(4096);
 
+    //存放结果集
     std::vector<Neighbor> full_retset;
     full_retset.reserve(4096);
     tsl::robin_map<_u64, T *> fp_coords;
@@ -826,6 +841,7 @@ namespace diskann {
     _u32                        best_medoid = 0;
     float                       best_dist = (std::numeric_limits<float>::max)();
     std::vector<SimpleNeighbor> medoid_dists;
+    // 比较query和哪个shard的中心点比较近。然后选择一个合适的导航点best_medoid。
     for (_u64 cur_m = 0; cur_m < num_medoids; cur_m++) {
       float cur_expanded_dist = dist_cmp_float->compare(
           query_float, centroid_data + aligned_dim * cur_m,
@@ -836,6 +852,7 @@ namespace diskann {
       }
     }
 
+    //比较query点到best_medoid的pq距离。
     compute_dists(&best_medoid, 1, dist_scratch);
     retset[0].id = best_medoid;
     retset[0].distance = dist_scratch[0];
@@ -852,6 +869,7 @@ namespace diskann {
     unsigned k = 0;
 
     // cleared every iteration
+    // 存放要从ssd上读取的节点信息
     std::vector<unsigned> frontier;
     std::vector<std::pair<unsigned, char *>> frontier_nhoods;
     std::vector<AlignedRead> frontier_read_reqs;
@@ -908,7 +926,7 @@ namespace diskann {
           }
         }
         marker++;
-      }
+      } // end while marker
 
       // read nhoods of frontier ids
       if (!frontier.empty()) {
@@ -939,7 +957,7 @@ namespace diskann {
         if (stats != nullptr) {
           stats->io_us += io_timer.elapsed();
         }
-      }
+      } // end if (!frontier.empty()) 
 
       // process cached nhoods
       for (auto &cached_nhood : cached_nhoods) {
@@ -947,6 +965,7 @@ namespace diskann {
         T *   node_fp_coords_copy = global_cache_iter->second;
         float cur_expanded_dist = dist_cmp->compare(query, node_fp_coords_copy,
                                                     (unsigned) aligned_dim);
+        // 把通过原始向量进行比较过距离的放入full_retset
         full_retset.push_back(
             Neighbor((unsigned) cached_nhood.first, cur_expanded_dist, true));
 
@@ -972,6 +991,7 @@ namespace diskann {
             float dist = dist_scratch[m];
             // diskann::cout << "cmp: " << id << ", dist: " << dist <<
             // std::endl; std::cerr << "dist: " << dist << std::endl;
+            // 候选集最大是cur_list_size个
             if (dist >= retset[cur_list_size - 1].distance &&
                 (cur_list_size == l_search))
               continue;
@@ -1003,6 +1023,7 @@ namespace diskann {
         auto &frontier_nhood = frontier_nhoods[completedIndex];
         (*ctx.m_pRequestsStatus)[completedIndex] = IOContext::PROCESS_COMPLETE;
 #else
+      // frontier_nhoods存放从磁盘读取到的节点
       for (auto &frontier_nhood : frontier_nhoods) {
 #endif
         char *node_disk_buf =

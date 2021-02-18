@@ -25,8 +25,8 @@ namespace math_utils {
 #pragma omp parallel for schedule(static, 8192)
     for (int64_t n_iter = 0; n_iter < (_s64) num_points; n_iter++) {
       vecs_l2sq[n_iter] =
-          cblas_snrm2((MKL_INT) dim, (data + (n_iter * dim)), 1);
-      vecs_l2sq[n_iter] *= vecs_l2sq[n_iter];
+          cblas_snrm2((MKL_INT) dim, (data + (n_iter * dim)), 1); //L2 Norm 
+      vecs_l2sq[n_iter] *= vecs_l2sq[n_iter]; //L2 Norm squared
     }
   }
 
@@ -355,6 +355,7 @@ namespace kmeans {
   // assumes memory allocated for pivot_data as new
   // float[num_centers*dim]
   // and select randomly num_centers points as pivots
+  // 随机从num_points中挑选num_centers个点做pivots
   void selecting_pivots(float* data, size_t num_points, size_t dim,
                         float* pivot_data, size_t num_centers) {
     //	pivot_data = new float[num_centers * dim];
@@ -379,8 +380,11 @@ namespace kmeans {
     }
   }
 
+  // 由于kmeans一开始随机选择的点比较关键。这里用了dart_val随机分位值，
+  // 所有点到上个选中的pivot点的距离之和的dart_val分位值所在的点来作为下个支点。
   void kmeanspp_selecting_pivots(float* data, size_t num_points, size_t dim,
                                  float* pivot_data, size_t num_centers) {
+    // 如果点数特别多，随机选择num_centers个点
     if (num_points > 1 << 23) {
       diskann::cout << "ERROR: n_pts " << num_points
                     << " currently not supported for k-means++, maximum is "
@@ -430,6 +434,7 @@ namespace kmeans {
 
       dart_val *= sum;
 
+      // 选择dart_val分位值的质心
       double prefix_sum = 0;
       for (size_t i = 0; i < (num_points); i++) {
         tmp_pivot = i;

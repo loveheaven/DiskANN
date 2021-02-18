@@ -18,7 +18,15 @@ namespace diskann {
     _u32*  chunk_offsets = nullptr;
     _u32*  rearrangement = nullptr;
     float* centroid = nullptr;
-    float* tables_T = nullptr;  // same as pq_tables, but col-major
+    float* tables_T = nullptr;  // same as pq_tables, but col-major. is transposed of tables
+    /*
+     * tables_T looks like:
+     *  dim0: p1, p2,p3,p4...
+     *  dim1: p1, p2,p3,p4...
+     *  ....
+     *  dimN: p1,p2,p3,p4...
+     * 
+     */ 
    public:
     FixedChunkPQTable() {
     }
@@ -42,6 +50,7 @@ namespace diskann {
     void load_pq_centroid_bin(MemoryMappedFiles& files,
                               const char* pq_table_file, size_t num_chunks){
 #else
+    // 这里会读取支点数据、_rearrangement_perm.bin、_chunk_offsets.bin、_centroid.bin
     void load_pq_centroid_bin(const char* pq_table_file, size_t num_chunks) {
 #endif
         std::string rearrangement_file = std::string(pq_table_file) +
@@ -126,6 +135,7 @@ namespace diskann {
     }
   }
 
+  // 计算query和每个chunk256个中心的距离。同一个chunk的256个距离挨着放在一起。
   void
   populate_chunk_distances(const T* query_vec, float* dist_vec) {
     memset(dist_vec, 0, 256 * n_chunks * sizeof(float));
@@ -142,6 +152,9 @@ namespace diskann {
           //             ((float) query_vec[permuted_dim_in_query] -
           //              centroid[permuted_dim_in_query]);
           // chunk_dists[idx] += (diff * diff);
+          
+          // centers_dim_vec[idx] is the j-th dim of idx-th pivot
+          // query_vec[permuted_dim_in_query] is the j-th of query
           double diff =
               centers_dim_vec[idx] - (query_vec[permuted_dim_in_query] -
                                       centroid[permuted_dim_in_query]);
